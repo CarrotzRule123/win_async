@@ -1,40 +1,48 @@
+mod inner;
+
+pub use inner::*;
+
 use std::io;
+use std::os::windows::prelude::{AsRawHandle, RawHandle};
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateIoRing, HIORING__, IORING_CREATE_ADVISORY_FLAGS_NONE, IORING_CREATE_FLAGS,
-    IORING_CREATE_REQUIRED_FLAGS_NONE, IORING_INFO, IORING_VERSION_3,
+    IORING_CREATE_REQUIRED_FLAGS_NONE, IORING_VERSION_3,
 };
 
 pub struct IoRing {
-    pub info: IORING_INFO,
     pub handle: HANDLE,
+}
+
+impl AsRawHandle for IoRing {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.handle as RawHandle
+    }
 }
 
 impl IoRing {
     pub fn new(entries: u32) -> io::Result<Self> {
-        let handle = 0;
-        let info = IORING_INFO {
-            IoRingVersion: IORING_VERSION_3,
-            Flags: IORING_CREATE_FLAGS {
-                Required: IORING_CREATE_REQUIRED_FLAGS_NONE,
-                Advisory: IORING_CREATE_ADVISORY_FLAGS_NONE,
-            },
-            SubmissionQueueSize: entries,
-            CompletionQueueSize: entries * 2,
-        };
-        let result = unsafe {
+        let mut handle = 0;
+        unsafe {
             CreateIoRing(
-                info.IoRingVersion,
-                info.Flags,
-                info.SubmissionQueueSize,
-                info.CompletionQueueSize,
-                &mut (handle as *mut HIORING__) as *mut *mut HIORING__,
+                IORING_VERSION_3,
+                IORING_CREATE_FLAGS {
+                    Required: IORING_CREATE_REQUIRED_FLAGS_NONE,
+                    Advisory: IORING_CREATE_ADVISORY_FLAGS_NONE,
+                },
+                entries,
+                entries * 2,
+                &mut handle as *mut isize as *mut *mut HIORING__,
             )
         };
-        if result != 0 {
+        if handle == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { handle, info })
+        Ok(Self { handle })
+    }
+
+    pub fn inner<'a>(&self) -> &'a IoRingInner {
+        unsafe { &*(self.handle as *mut IoRingInner) }
     }
 }
