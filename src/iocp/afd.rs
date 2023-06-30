@@ -1,16 +1,19 @@
 use std::ffi::c_void;
-use std::os::windows::prelude::RawSocket;
+use std::sync::atomic::{Ordering, AtomicUsize};
 
 use windows_sys::Win32::Foundation::{
     RtlNtStatusToDosError, HANDLE, NTSTATUS, STATUS_NOT_FOUND, STATUS_PENDING, STATUS_SUCCESS,
-    UNICODE_STRING,
+    UNICODE_STRING, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    NtCreateFile, FILE_OPEN, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    NtCreateFile, SetFileCompletionNotificationModes, FILE_OPEN, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    SYNCHRONIZE,
 };
 use windows_sys::Win32::System::WindowsProgramming::{
-    NtDeviceIoControlFile, IO_STATUS_BLOCK, IO_STATUS_BLOCK_0, OBJECT_ATTRIBUTES,
+    NtDeviceIoControlFile, IO_STATUS_BLOCK, IO_STATUS_BLOCK_0, OBJECT_ATTRIBUTES, FILE_SKIP_SET_EVENT_ON_HANDLE,
 };
+
+use crate::CompletionPort;
 
 #[link(name = "ntdll")]
 extern "system" {
@@ -26,26 +29,35 @@ extern "system" {
     ) -> NTSTATUS;
 }
 
+static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(0);
+
 macro_rules! s {
     ($($id:expr)+) => {
         &[$($id as u16),+]
     }
 }
 
-const AFD_NAME: &[u16] = s!['\\' 'D' 'e' 'v' 'i' 'c' 'e' '\\' 'A' 'f' 'd' '\\' 'I' 'o'];
+pub const POLL_RECEIVE: u32 = 0b0_0000_0001;
+pub const POLL_RECEIVE_EXPEDITED: u32 = 0b0_0000_0010;
+pub const POLL_SEND: u32 = 0b0_0000_0100;
+pub const POLL_DISCONNECT: u32 = 0b0_0000_1000;
+pub const POLL_ABORT: u32 = 0b0_0001_0000;
+pub const POLL_LOCAL_CLOSE: u32 = 0b0_0010_0000;
+// Not used as it indicated in each event where a connection is connected, not
+// just the first time a connection is established.
+// Also see https://github.com/piscisaureus/wepoll/commit/8b7b340610f88af3d83f40fb728e7b850b090ece.
+pub const POLL_CONNECT: u32 = 0b0_0100_0000;
+pub const POLL_ACCEPT: u32 = 0b0_1000_0000;
+pub const POLL_CONNECT_FAIL: u32 = 0b1_0000_0000;
 
-pub type AfdPollEvent = u32;
-
-pub enum AfdPollEvents {
-    Receive = 0x001,
-    ReceiveExpedited = 0x002,
-    Send = 0x004,
-    Disconnect = 0x008,
-    Abort = 0x010,
-    LocalClose = 0x020,
-    Accept = 0x080,
-    ConnectFail = 0x100,
-}
+pub const KNOWN_EVENTS: u32 = POLL_RECEIVE
+    | POLL_RECEIVE_EXPEDITED
+    | POLL_SEND
+    | POLL_DISCONNECT
+    | POLL_ABORT
+    | POLL_LOCAL_CLOSE
+    | POLL_ACCEPT
+    | POLL_CONNECT_FAIL;
 
 #[repr(C)]
 pub struct AfdPollHandleInfo {
@@ -57,7 +69,7 @@ pub struct AfdPollHandleInfo {
 #[repr(C)]
 pub struct AfdPollInfo {
     pub timeout: i64,
-    pub handle_count: u32,
+    pub number_of_handles: u32,
     pub exclusive: u32,
     pub handles: [AfdPollHandleInfo; 1],
 }
@@ -67,7 +79,8 @@ pub struct Afd {
 }
 
 impl Afd {
-    pub(super) fn new() -> std::io::Result<Self> {
+    pub fn new(cp: &CompletionPort) -> std::io::Result<Self> {
+        const AFD_NAME: &[u16] = s!['\\' 'D' 'e' 'v' 'i' 'c' 'e' '\\' 'A' 'f' 'd' '\\' 'I' 'o'];
         let mut device_name = UNICODE_STRING {
             Length: std::mem::size_of_val(AFD_NAME) as u16,
             MaximumLength: std::mem::size_of_val(AFD_NAME) as u16,
@@ -103,37 +116,55 @@ impl Afd {
             let error = unsafe { RtlNtStatusToDosError(result) };
             return Err(std::io::Error::from_raw_os_error(error as i32));
         }
-        Ok(Self { handle })
-    }
 
-    pub fn poll(
-        &self,
-        info: *mut AfdPollInfo,
-        iosb: *mut IO_STATUS_BLOCK,
-        base_socket: RawSocket,
-    ) -> std::io::Result<()> {
-        const IOCTL_AFD_POLL: u32 = 0x00012024;
-        unsafe { (*iosb).Anonymous.Status = STATUS_PENDING };
+        // Increment by 2 to reserve space for other types of handles.
+        // Non-AFD types (currently only NamedPipe), use odd numbered
+        // tokens. This allows the selector to differentiate between them
+        // and dispatch events accordingly.
+        let token = NEXT_TOKEN.fetch_add(2, Ordering::Relaxed) + 2;
+        cp.add_handle(token, handle)?;
         let result = unsafe {
-            NtDeviceIoControlFile(
-                self.handle,
-                0,
-                None,
-                iosb as *mut c_void,
-                iosb,
-                IOCTL_AFD_POLL,
-                info as *mut c_void,
-                std::mem::size_of::<AfdPollInfo>() as u32,
-                info as *mut c_void,
-                std::mem::size_of::<AfdPollInfo>() as u32,
+            SetFileCompletionNotificationModes(
+                INVALID_HANDLE_VALUE,
+                FILE_SKIP_SET_EVENT_ON_HANDLE as u8, // This is just 2, so fits in u8
             )
         };
+
+        if result == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(Self { handle })
+        }
+    }
+
+    pub unsafe fn poll(
+        &self,
+        info: &mut AfdPollInfo,
+        iosb: *mut IO_STATUS_BLOCK,
+        overlapped: *mut c_void,
+    ) -> std::io::Result<()> {
+        const IOCTL_AFD_POLL: u32 = 0x00012024;
+        let info_ptr = info as *mut _ as *mut c_void;
+        (*iosb).Anonymous.Status = STATUS_PENDING;
+
+        let result = NtDeviceIoControlFile(
+            self.handle,
+            0,
+            None,
+            overlapped,
+            iosb,
+            IOCTL_AFD_POLL,
+            info_ptr,
+            std::mem::size_of::<AfdPollInfo>() as u32,
+            info_ptr,
+            std::mem::size_of::<AfdPollInfo>() as u32,
+        );
 
         match result {
             STATUS_SUCCESS => Ok(()),
             STATUS_PENDING => Err(std::io::ErrorKind::WouldBlock.into()),
             status => {
-                let error = unsafe { RtlNtStatusToDosError(status) };
+                let error = RtlNtStatusToDosError(status);
                 Err(std::io::Error::from_raw_os_error(error as i32))
             }
         }

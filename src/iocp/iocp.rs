@@ -23,18 +23,18 @@ impl CompletionPort {
         }
     }
 
-    pub fn add_handle(&self, handle: impl IntoRawHandle) -> std::io::Result<()> {
-        let handle = handle.into_raw_handle();
+    pub fn add_handle(&self, token: usize, handle: HANDLE) -> std::io::Result<()> {
         let result =
-            unsafe { CreateIoCompletionPort(handle as HANDLE, self.handle, handle as usize, 0) };
+            unsafe { CreateIoCompletionPort(handle, self.handle, token, 0) };
 
         if result == 0 {
             return Err(std::io::Error::last_os_error());
-        };
-        Ok(())
+        } else {
+            Ok(())
+        }
     }
 
-    pub fn poll<'a>(
+    pub fn get_many<'a>(
         &self,
         entries: &'a mut [OVERLAPPED_ENTRY],
         timeout: Option<Duration>,
