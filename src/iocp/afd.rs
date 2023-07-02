@@ -1,16 +1,19 @@
 use std::ffi::c_void;
-use std::sync::atomic::{Ordering, AtomicUsize};
+use std::fs::File;
+use std::os::windows::prelude::{AsRawHandle, FromRawHandle, RawHandle};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
-    RtlNtStatusToDosError, HANDLE, NTSTATUS, STATUS_NOT_FOUND, STATUS_PENDING, STATUS_SUCCESS,
-    UNICODE_STRING, INVALID_HANDLE_VALUE,
+    RtlNtStatusToDosError, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_NOT_FOUND,
+    STATUS_PENDING, STATUS_SUCCESS, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     NtCreateFile, SetFileCompletionNotificationModes, FILE_OPEN, FILE_SHARE_READ, FILE_SHARE_WRITE,
     SYNCHRONIZE,
 };
 use windows_sys::Win32::System::WindowsProgramming::{
-    NtDeviceIoControlFile, IO_STATUS_BLOCK, IO_STATUS_BLOCK_0, OBJECT_ATTRIBUTES, FILE_SKIP_SET_EVENT_ON_HANDLE,
+    NtDeviceIoControlFile, FILE_SKIP_SET_EVENT_ON_HANDLE, IO_STATUS_BLOCK, IO_STATUS_BLOCK_0,
+    OBJECT_ATTRIBUTES,
 };
 
 use crate::CompletionPort;
@@ -75,7 +78,7 @@ pub struct AfdPollInfo {
 }
 
 pub struct Afd {
-    handle: HANDLE,
+    file: File,
 }
 
 impl Afd {
@@ -94,7 +97,7 @@ impl Afd {
             SecurityDescriptor: std::ptr::null_mut(),
             SecurityQualityOfService: std::ptr::null_mut(),
         };
-        let mut handle = 0 as HANDLE;
+        let mut handle = INVALID_HANDLE_VALUE;
         let mut iosb = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
         let result = unsafe {
             NtCreateFile(
@@ -117,15 +120,16 @@ impl Afd {
             return Err(std::io::Error::from_raw_os_error(error as i32));
         }
 
+        let file = unsafe { File::from_raw_handle(handle as RawHandle) };
         // Increment by 2 to reserve space for other types of handles.
         // Non-AFD types (currently only NamedPipe), use odd numbered
         // tokens. This allows the selector to differentiate between them
         // and dispatch events accordingly.
         let token = NEXT_TOKEN.fetch_add(2, Ordering::Relaxed) + 2;
-        cp.add_handle(token, handle)?;
+        cp.add_handle(token, file.as_raw_handle() as HANDLE)?;
         let result = unsafe {
             SetFileCompletionNotificationModes(
-                INVALID_HANDLE_VALUE,
+                handle,
                 FILE_SKIP_SET_EVENT_ON_HANDLE as u8, // This is just 2, so fits in u8
             )
         };
@@ -133,7 +137,7 @@ impl Afd {
         if result == 0 {
             Err(std::io::Error::last_os_error())
         } else {
-            Ok(Self { handle })
+            Ok(Self { file })
         }
     }
 
@@ -142,13 +146,13 @@ impl Afd {
         info: &mut AfdPollInfo,
         iosb: *mut IO_STATUS_BLOCK,
         overlapped: *mut c_void,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<bool> {
         const IOCTL_AFD_POLL: u32 = 0x00012024;
         let info_ptr = info as *mut _ as *mut c_void;
         (*iosb).Anonymous.Status = STATUS_PENDING;
 
         let result = NtDeviceIoControlFile(
-            self.handle,
+            self.file.as_raw_handle() as HANDLE,
             0,
             None,
             overlapped,
@@ -161,8 +165,8 @@ impl Afd {
         );
 
         match result {
-            STATUS_SUCCESS => Ok(()),
-            STATUS_PENDING => Err(std::io::ErrorKind::WouldBlock.into()),
+            STATUS_SUCCESS => Ok(true),
+            STATUS_PENDING => Ok(false),
             status => {
                 let error = RtlNtStatusToDosError(status);
                 Err(std::io::Error::from_raw_os_error(error as i32))
@@ -178,7 +182,7 @@ impl Afd {
             Anonymous: IO_STATUS_BLOCK_0 { Status: 0 },
             Information: 0,
         };
-        let status = NtCancelIoFileEx(self.handle as HANDLE, iosb, &mut cancel_iosb);
+        let status = NtCancelIoFileEx(self.file.as_raw_handle() as HANDLE, iosb, &mut cancel_iosb);
 
         if status == STATUS_SUCCESS || status == STATUS_NOT_FOUND {
             Ok(())

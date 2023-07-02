@@ -22,6 +22,22 @@ pub enum SockPollStatus {
     Cancelled,
 }
 
+pub struct SocketState {
+    pub inner: Option<Pin<Arc<Mutex<SockState>>>>,
+    pub token: mio::Token,
+    pub interest: mio::Interest,
+}
+
+impl SocketState {
+    pub fn new() -> Self {
+        Self {
+            inner: None,
+            token: mio::Token(0),
+            interest: mio::Interest::READABLE,
+        }
+    }
+}
+
 pub struct SockState {
     pub iosb: IO_STATUS_BLOCK,
     pub poll_info: AfdPollInfo,

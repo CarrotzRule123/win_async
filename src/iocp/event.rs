@@ -43,6 +43,30 @@ impl Event {
             Internal: 0,
         }
     }
+
+    pub fn is_readable(&self) -> bool {
+        self.flags & READABLE_FLAGS != 0
+    }
+    
+    pub fn is_writable(&self) -> bool {
+        self.flags & WRITABLE_FLAGS != 0
+    }
+    
+    pub fn is_error(&self) -> bool {
+        self.flags & ERROR_FLAGS != 0
+    }
+    
+    pub fn is_read_closed(&self) -> bool {
+        self.flags & READ_CLOSED_FLAGS != 0
+    }
+    
+    pub fn is_write_closed(&self) -> bool {
+        self.flags & WRITE_CLOSED_FLAGS != 0
+    }
+    
+    pub fn is_priority(&self) -> bool {
+        self.flags & afd::POLL_RECEIVE_EXPEDITED != 0
+    }
 }
 
 pub(crate) const READABLE_FLAGS: u32 = afd::POLL_RECEIVE
@@ -56,40 +80,6 @@ pub(crate) const READ_CLOSED_FLAGS: u32 =
     afd::POLL_DISCONNECT | afd::POLL_ABORT | afd::POLL_CONNECT_FAIL;
 pub(crate) const WRITE_CLOSED_FLAGS: u32 = afd::POLL_ABORT | afd::POLL_CONNECT_FAIL;
 
-pub fn is_readable(event: &Event) -> bool {
-    event.flags & READABLE_FLAGS != 0
-}
-
-pub fn is_writable(event: &Event) -> bool {
-    event.flags & WRITABLE_FLAGS != 0
-}
-
-pub fn is_error(event: &Event) -> bool {
-    event.flags & ERROR_FLAGS != 0
-}
-
-pub fn is_read_closed(event: &Event) -> bool {
-    event.flags & READ_CLOSED_FLAGS != 0
-}
-
-pub fn is_write_closed(event: &Event) -> bool {
-    event.flags & WRITE_CLOSED_FLAGS != 0
-}
-
-pub fn is_priority(event: &Event) -> bool {
-    event.flags & afd::POLL_RECEIVE_EXPEDITED != 0
-}
-
-pub fn is_aio(_: &Event) -> bool {
-    // Not supported.
-    false
-}
-
-pub fn is_lio(_: &Event) -> bool {
-    // Not supported.
-    false
-}
-
 pub struct Events {
     pub statuses: Box<[OVERLAPPED_ENTRY]>,
 
@@ -99,7 +89,7 @@ pub struct Events {
 impl Events {
     pub fn with_capacity(cap: usize) -> Events {
         Events {
-            statuses: Vec::with_capacity(cap).into_boxed_slice(),
+            statuses: unsafe { vec![std::mem::zeroed(); cap].into_boxed_slice() },
             events: Vec::with_capacity(cap),
         }
     }

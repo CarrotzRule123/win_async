@@ -117,45 +117,73 @@ impl Poller {
     pub fn register<T: AsRawSocket>(
         &self,
         socket: &mut T,
+        state: &mut SocketState,
         token: mio::Token,
         interests: mio::Interest,
     ) -> std::io::Result<()> {
-        let flags = interests_to_afd_flags(interests);
-        let socket = socket.as_raw_socket();
+        if state.inner.is_none() {
+            let flags = interests_to_afd_flags(interests);
+            let socket = socket.as_raw_socket();
 
-        let sock = {
-            let sock = self._alloc_sock_for_rawsocket(socket)?;
-            let event = Event {
-                flags,
-                data: token.0 as u64,
+            let inner = {
+                let sock = self._alloc_sock_for_rawsocket(socket)?;
+                let event = Event {
+                    flags,
+                    data: token.0 as u64,
+                };
+                sock.lock().unwrap().set_event(event);
+                sock
             };
-            sock.lock().unwrap().set_event(event);
-            sock
-        };
 
-        self.queue_state(sock);
-        unsafe { self.update_sockets_events_if_polling()? };
+            self.queue_state(inner.clone());
+            unsafe { self.update_sockets_events_if_polling()? };
+            state.inner = Some(inner);
+            state.token = token;
+            state.interest = interests;
 
-        Ok(())
+            Ok(())
+        } else {
+            Err(std::io::ErrorKind::AlreadyExists.into())
+        }
     }
 
     pub fn reregister(
         &self,
-        state: Pin<Arc<Mutex<SockState>>>,
+        state: &mut SocketState,
         token: mio::Token,
         interests: mio::Interest,
     ) -> std::io::Result<()> {
-        {
-            let event = Event {
-                flags: interests_to_afd_flags(interests),
-                data: token.0 as u64,
-            };
+        if let Some(inner) = state.inner.as_mut() {
+            {
+                let event = Event {
+                    flags: interests_to_afd_flags(interests),
+                    data: token.0 as u64,
+                };
 
-            state.lock().unwrap().set_event(event);
+                inner.lock().unwrap().set_event(event);
+            }
+
+            state.token = token;
+            state.interest = interests;
+
+            self.queue_state(inner.clone());
+            unsafe { self.update_sockets_events_if_polling() }
+        } else {
+            Err(std::io::ErrorKind::NotFound.into())
         }
+    }
 
-        self.queue_state(state);
-        unsafe { self.update_sockets_events_if_polling() }
+    pub fn deregister(&mut self, state: &mut SocketState) -> std::io::Result<()> {
+        if let Some(inner) = state.inner.as_mut() {
+            {
+                let mut sock_state = inner.lock().unwrap();
+                sock_state.mark_delete();
+            }
+            state.inner = None;
+            Ok(())
+        } else {
+            Err(std::io::ErrorKind::NotFound.into())
+        }
     }
 
     /// This function is called by register() and reregister() to start an
