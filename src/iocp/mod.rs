@@ -247,6 +247,39 @@ impl Poller {
     }
 }
 
+impl Drop for Poller {
+    fn drop(&mut self) {
+        loop {
+            let count: usize;
+            let mut statuses: [OVERLAPPED_ENTRY; 1024] = unsafe { std::mem::zeroed() };
+
+            let result = self
+                .cp
+                .get_many(&mut statuses, Some(std::time::Duration::from_millis(0)));
+            match result {
+                Ok(events) => {
+                    count = events.iter().len();
+                    for event in events.iter() {
+                        if event.lpOverlapped.is_null() {
+                        } else {
+                            // drain sock state to release memory of Arc reference
+                            let _ = from_overlapped(event.lpOverlapped);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+
+            if count == 0 {
+                break;
+            }
+        }
+
+        let mut afd_group = self.afd.lock().unwrap();
+        afd_group.retain(|g| Arc::strong_count(g) > 1);
+    }
+}
+
 pub fn from_overlapped(ptr: *mut OVERLAPPED) -> Pin<Arc<Mutex<SockState>>> {
     let sock_ptr: *const Mutex<SockState> = ptr as *const _;
     unsafe { Pin::new_unchecked(Arc::from_raw(sock_ptr)) }
